@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use chrono::NaiveDateTime;
-use sqlx::{postgres::PgRow, FromRow, Row};
+use serde::Deserialize;
+use sqlx::FromRow;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Rating {
@@ -117,85 +118,82 @@ pub struct BooruPost {
     pub tag_count_meta: u16,
 }
 
-impl FromRow<'_, PgRow> for BooruPost {
-    fn from_row(row: &PgRow) -> sqlx::Result<Self> {
-        let id: i32 = row.try_get("id")?;
-        let parent_id: Option<i32> = row.try_get("parent_id")?;
-        let pixiv_id: Option<i32> = row.try_get("pixiv_id")?;
+#[derive(Clone, Debug, Deserialize, FromRow)]
+pub struct RawBooruPost {
+    pub id: i32,
+    pub parent_id: Option<i32>,
+    pub pixiv_id: Option<i32>,
 
-        let uploader_id: i32 = row.try_get("uploader_id")?;
-        let approver_id: Option<i32> = row.try_get("approver_id")?;
-        let is_banned: bool = row.try_get("is_banned")?;
-        let is_deleted: bool = row.try_get("is_deleted")?;
-        let is_flagged: bool = row.try_get("is_flagged")?;
-        let is_pending: bool = row.try_get("is_pending")?;
+    pub uploader_id: i32,
+    pub approver_id: Option<i32>,
+    pub is_banned: bool,
+    pub is_deleted: bool,
+    pub is_flagged: bool,
+    pub is_pending: bool,
 
-        let created_at: NaiveDateTime = row.try_get("created_at")?;
-        let updated_at: NaiveDateTime = row.try_get("updated_at")?;
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
 
-        let fav_count: i32 = row.try_get("fav_count")?;
-        let up_score: i32 = row.try_get("up_score")?;
-        let down_score: i32 = row.try_get("down_score")?;
+    pub fav_count: i32,
+    pub up_score: i32,
+    pub down_score: i32,
 
-        let source: String = row.try_get("source")?;
-        let width: i32 = row.try_get("image_width")?;
-        let height: i32 = row.try_get("image_height")?;
-        let file_ext: String = row.try_get("file_ext")?;
-        let file_size: i32 = row.try_get("file_size")?;
+    pub source: String,
+    pub image_width: i32,
+    pub image_height: i32,
+    pub file_ext: String,
+    pub file_size: i32,
 
-        let rating: String = row.try_get("rating")?;
+    pub rating: String,
 
-        let tag_string: String = row.try_get("tag_string")?;
-        let tag_count_general: i32 = row.try_get("tag_count_general")?;
-        let tag_count_artist: i32 = row.try_get("tag_count_artist")?;
-        let tag_count_character: i32 = row.try_get("tag_count_character")?;
-        let tag_count_copyright: i32 = row.try_get("tag_count_copyright")?;
-        let tag_count_meta: i32 = row.try_get("tag_count_meta")?;
+    pub tag_string: String,
+    pub tag_count_general: i32,
+    pub tag_count_artist: i32,
+    pub tag_count_character: i32,
+    pub tag_count_copyright: i32,
+    pub tag_count_meta: i32,
+}
 
-        let post = Self {
-            id: id as u32,
-            parent_id: parent_id.map(|i| i as u32),
-            pixiv_id: pixiv_id.map(|i| i as u32),
-
-            uploader_id: uploader_id as u32,
-            approver_id: approver_id.map(|i| i as u32),
-            status: if is_banned {
+impl From<RawBooruPost> for BooruPost {
+    fn from(raw: RawBooruPost) -> Self {
+        Self {
+            id: raw.id as u32,
+            parent_id: raw.parent_id.map(|i| i as u32),
+            pixiv_id: raw.pixiv_id.map(|i| i as u32),
+            uploader_id: raw.uploader_id as u32,
+            approver_id: raw.approver_id.map(|i| i as u32),
+            status: if raw.is_banned {
                 Status::Banned
-            } else if is_deleted {
+            } else if raw.is_deleted {
                 Status::Deleted
-            } else if is_flagged {
+            } else if raw.is_flagged {
                 Status::Flagged
-            } else if is_pending {
+            } else if raw.is_pending {
                 Status::Pending
             } else {
                 Status::Active
             },
-
-            created_at,
-            updated_at,
-
-            fav_count: fav_count as u32,
-            up_score,
-            down_score,
-
-            source,
-            width: width as u16,
-            height: height as u16,
-            file_ext: file_ext.parse().unwrap(),
-            file_size: file_size as u32,
-
-            rating: rating.parse().unwrap(),
-
-            tags: tag_string
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+            fav_count: raw.fav_count as u32,
+            up_score: raw.up_score,
+            down_score: raw.down_score,
+            source: raw.source,
+            width: raw.image_width as u16,
+            height: raw.image_height as u16,
+            file_ext: raw.file_ext.parse().unwrap(),
+            file_size: raw.file_size as u32,
+            rating: raw.rating.parse().unwrap(),
+            tags: raw
+                .tag_string
                 .split_whitespace()
                 .map(|t| t.to_string())
                 .collect(),
-            tag_count_general: tag_count_general as u16,
-            tag_count_artist: tag_count_artist as u16,
-            tag_count_character: tag_count_character as u16,
-            tag_count_copyright: tag_count_copyright as u16,
-            tag_count_meta: tag_count_meta as u16,
-        };
-        Ok(post)
+            tag_count_general: raw.tag_count_general as u16,
+            tag_count_artist: raw.tag_count_artist as u16,
+            tag_count_character: raw.tag_count_character as u16,
+            tag_count_copyright: raw.tag_count_copyright as u16,
+            tag_count_meta: raw.tag_count_meta as u16,
+        }
     }
 }
