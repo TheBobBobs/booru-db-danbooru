@@ -125,10 +125,10 @@ async fn main() {
         let mut pg_listener = pg_listener.await.unwrap().unwrap();
         tokio::spawn(async move {
             while let Ok(notif) = pg_listener.recv().await {
-                dbg!(&notif);
+                let channel = notif.channel();
                 let payload = notif.payload();
                 let start_time = Instant::now();
-                match notif.channel() {
+                match channel {
                     "public_posts_update" => {
                         let data: Update = serde_json::from_str(payload).unwrap();
                         let old: BooruPost = data.old.into();
@@ -169,7 +169,7 @@ async fn main() {
                     }
                 };
                 let elapsed = start_time.elapsed().as_nanos();
-                println!("ProcessEvent: {:.3}ms", elapsed as f64 / 1000.0 / 1000.0);
+                println!("{channel}: {:.3}ms", elapsed as f64 / 1000.0 / 1000.0);
             }
         });
     }
@@ -227,9 +227,9 @@ async fn get_posts(
         limit,
     }): RQuery<GetPostsQuery>,
 ) -> Json<PostsResponse> {
+    println!("{}", &query);
     let mut query = Query::parse(&query).unwrap(); // TODO
     query.simplify();
-    dbg!(&query);
     let db = db.read().await;
     let start_time = Instant::now();
     let result = db.query(&query).unwrap(); // TODO
@@ -253,7 +253,7 @@ async fn get_posts(
         }
     };
     let elapsed = start_time.elapsed().as_nanos();
-    println!("Sort: {:.3}ms", elapsed as f64 / 1000.0 / 1000.0);
+    println!("Sort-{sort:?}: {:.3}ms", elapsed as f64 / 1000.0 / 1000.0);
     let id_index: &IdIndex = db.index().unwrap();
     let post_ids: Vec<_> = ids
         .into_iter()
