@@ -9,7 +9,7 @@ pub use id::{IdIndex, IdIndexLoader};
 // mod pool;
 // pub use pool::{Pool, PoolCategory, PoolIndex};
 mod tag;
-pub use tag::TagIndexLoader;
+pub use tag::{TagDbCountIndex, TagDbIdIndex, TagIndex, TagIndexLoader};
 // mod user;
 // pub use user::{UserIndex, UserIndexLoader};
 

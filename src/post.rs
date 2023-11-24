@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use chrono::NaiveDateTime;
 use serde::Deserialize;
@@ -110,7 +110,7 @@ pub struct BooruPost {
 
     pub rating: Rating,
 
-    pub tags: Vec<String>,
+    pub tags: Vec<Arc<str>>,
     pub tag_count_general: u16,
     pub tag_count_artist: u16,
     pub tag_count_character: u16,
@@ -187,7 +187,7 @@ impl From<RawBooruPost> for BooruPost {
             tags: raw
                 .tag_string
                 .split_whitespace()
-                .map(|t| t.to_string())
+                .map(|t| t.to_string().into())
                 .collect(),
             tag_count_general: raw.tag_count_general as u16,
             tag_count_artist: raw.tag_count_artist as u16,

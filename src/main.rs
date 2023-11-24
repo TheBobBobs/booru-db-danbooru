@@ -5,7 +5,7 @@ use std::{
 };
 
 use axum::{extract::Query as RQuery, routing::get, Extension, Json, Router};
-use booru_db::{db, Packed, Query, PACKED_SIZE};
+use booru_db::{db, Query};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgListener, Executor};
@@ -142,18 +142,7 @@ async fn main() {
                         let raw: RawBooruPost = serde_json::from_str(payload).unwrap();
                         let post = raw.into();
                         let mut db = db.write().await;
-                        let checks = db.checks();
-                        let mut id = checks.len() as u32 * PACKED_SIZE;
-                        'outer: for (index, &c) in checks.iter().enumerate() {
-                            if c != Packed::MAX {
-                                for i in 0..PACKED_SIZE {
-                                    if (c & (1 << i)) == 0 {
-                                        id = (index as u32 * PACKED_SIZE) + i;
-                                        break 'outer;
-                                    }
-                                }
-                            }
-                        }
+                        let id = db.next_id();
                         db.insert(id, &post);
                     }
                     "public_posts_delete" => {
@@ -176,6 +165,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/posts", get(get_posts))
+        .route("/tags", get(get_tags))
         .layer(Extension(db.clone()));
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let _ = axum::Server::bind(&addr)
@@ -197,25 +187,32 @@ pub enum Sort {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GetPostsQuery {
-    #[serde(default)]
+    #[serde(default, alias = "q")]
     query: String,
     #[serde(default)]
     sort: Sort,
 
     #[serde(default)]
     page: usize,
-    #[serde(default = "default_limit")]
+    #[serde(default = "posts_default_limit")]
     limit: usize,
 }
 
-const fn default_limit() -> usize {
+const fn posts_default_limit() -> usize {
     20
 }
 
+#[derive(Default, Serialize)]
+struct PostsResponseTimings {
+    query: u64,
+    sort: u64,
+}
+
 #[derive(Serialize)]
-pub struct PostsResponse {
+struct PostsResponse {
     matched: usize,
     url: String,
+    timings: PostsResponseTimings,
 }
 
 async fn get_posts(
@@ -227,14 +224,17 @@ async fn get_posts(
         limit,
     }): RQuery<GetPostsQuery>,
 ) -> Json<PostsResponse> {
-    println!("{}", &query);
+    let mut timings = PostsResponseTimings::default();
+
     let mut query = Query::parse(&query).unwrap(); // TODO
     query.simplify();
+
     let db = db.read().await;
+
     let start_time = Instant::now();
     let result = db.query(&query).unwrap(); // TODO
     let elapsed = start_time.elapsed().as_nanos();
-    println!("Query: {:.3}ms", elapsed as f64 / 1000.0 / 1000.0);
+    timings.query = elapsed as u64;
 
     let index = page * limit;
     let start_time = Instant::now();
@@ -253,7 +253,8 @@ async fn get_posts(
         }
     };
     let elapsed = start_time.elapsed().as_nanos();
-    println!("Sort-{sort:?}: {:.3}ms", elapsed as f64 / 1000.0 / 1000.0);
+    timings.sort = elapsed as u64;
+
     let id_index: &IdIndex = db.index().unwrap();
     let post_ids: Vec<_> = ids
         .into_iter()
@@ -265,6 +266,105 @@ async fn get_posts(
     let url = format!("https://danbooru.donmai.us/posts?tags=id:{id_search}+order:custom");
 
     let matched = result.matched();
-    let response = PostsResponse { matched, url };
+    let response = PostsResponse {
+        matched,
+        url,
+        timings,
+    };
+    response.into()
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagsSort {
+    CountAsc,
+    #[default]
+    #[serde(alias = "count")]
+    CountDesc,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GetTagsQuery {
+    #[serde(default, alias = "q")]
+    query: String,
+    #[serde(default)]
+    sort: TagsSort,
+
+    #[serde(default)]
+    page: usize,
+    #[serde(default = "tags_default_limit")]
+    limit: usize,
+}
+
+const fn tags_default_limit() -> usize {
+    20
+}
+
+#[derive(Default, Serialize)]
+struct TagsResponseTimings {
+    query: u64,
+    sort: u64,
+}
+
+#[derive(Serialize)]
+struct TagsResponse {
+    tags: Vec<(Arc<str>, u32)>,
+    matched: usize,
+    timings: TagsResponseTimings,
+}
+
+async fn get_tags(
+    Extension(db): Extension<Arc<RwLock<Db>>>,
+    RQuery(GetTagsQuery {
+        query,
+        sort,
+        page,
+        limit,
+    }): RQuery<GetTagsQuery>,
+) -> Json<TagsResponse> {
+    let mut timings = TagsResponseTimings::default();
+
+    let mut query = Query::parse(&query).unwrap(); // TODO
+    query.simplify();
+
+    let db = db.read().await;
+    let tag_index: &TagIndex = db.index().unwrap();
+    let tag_db = &tag_index.tag_db;
+
+    let start_time = Instant::now();
+    let result = tag_db.query(&query).unwrap(); // TODO
+    let elapsed = start_time.elapsed().as_nanos();
+    timings.query = elapsed as u64;
+
+    let index = page * limit;
+    let start_time = Instant::now();
+    let ids = match sort {
+        TagsSort::CountAsc | TagsSort::CountDesc => {
+            let reverse = matches!(sort, TagsSort::CountDesc);
+            let count_index: &TagDbCountIndex = tag_db.index().unwrap();
+            let sort = count_index.range_index.ids().iter().copied();
+            result.get_sorted(sort, index, limit, reverse)
+        }
+    };
+    let elapsed = start_time.elapsed().as_nanos();
+    timings.sort = elapsed as u64;
+
+    let id_index: &TagDbIdIndex = tag_db.index().unwrap();
+    let tags: Vec<_> = ids
+        .into_iter()
+        .map(|id| {
+            let name = id_index.id_to_name.get(&id).unwrap();
+            let count = tag_index.keys_index.items.get(name).unwrap().matched() as u32;
+            (name.clone(), count)
+        })
+        .collect();
+    drop(db);
+
+    let matched = result.matched();
+    let response = TagsResponse {
+        tags,
+        matched,
+        timings,
+    };
     response.into()
 }
