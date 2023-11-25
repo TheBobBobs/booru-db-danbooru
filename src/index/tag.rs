@@ -5,7 +5,8 @@ use std::{
 
 use booru_db::{
     index::{
-        Index, IndexLoader, KeysIndex, KeysIndexLoader, NgramIndex, RangeIndex, RangeIndexLoader,
+        Index, IndexLoader, KeyIndex, KeyIndexLoader, KeysIndex, KeysIndexLoader, NgramIndex,
+        RangeIndex, RangeIndexLoader,
     },
     query::Item,
     Query, Queryable, RangeQuery, TextQuery, ID,
@@ -129,20 +130,31 @@ impl Index<Tag> for TagDbCountIndex {
     }
 }
 
+fn abbreviate(text: &str) -> String {
+    text.replace(|c| ['(', ')'].contains(&c), "")
+        .split('_')
+        .filter_map(|w| w.chars().next())
+        .collect()
+}
+
 #[derive(Default)]
 struct TagDbNameIndexLoader {
+    abbreviations: KeyIndexLoader<String>,
     n1gram_index: NgramIndex<1>,
     n2gram_index: NgramIndex<2>,
 }
 
 impl IndexLoader<Tag> for TagDbNameIndexLoader {
     fn add(&mut self, id: ID, tag: &Tag) {
+        let abv = abbreviate(&tag.name);
+        self.abbreviations.add(id, &abv);
         self.n1gram_index.insert(id, tag.name.clone());
         self.n2gram_index.insert(id, tag.name.clone());
     }
 
     fn load(self: Box<Self>) -> Box<dyn Index<Tag>> {
         Box::new(TagDbNameIndex {
+            abbreviations: self.abbreviations.load(),
             n1gram_index: self.n1gram_index,
             n2gram_index: self.n2gram_index,
         })
@@ -151,6 +163,7 @@ impl IndexLoader<Tag> for TagDbNameIndexLoader {
 
 #[derive(Default)]
 struct TagDbNameIndex {
+    abbreviations: KeyIndex<String>,
     n1gram_index: NgramIndex<1>,
     n2gram_index: NgramIndex<2>,
 }
@@ -162,6 +175,12 @@ impl Index<Tag> for TagDbNameIndex {
         text: &str,
         inverse: bool,
     ) -> Option<Query<Queryable<'s>>> {
+        if let Some(abv) = text.strip_prefix('/') {
+            return self
+                .abbreviations
+                .get(abv)
+                .map(|q| Query::new(Item::Single(q), inverse));
+        }
         let query: TextQuery = text.parse().ok()?;
         let text = query.text();
         let Some(smallest) = (match text.len() {
@@ -204,11 +223,15 @@ impl Index<Tag> for TagDbNameIndex {
     }
 
     fn insert(&mut self, id: ID, tag: &Tag) {
+        let abv = abbreviate(&tag.name);
+        self.abbreviations.insert(id, &abv);
         self.n1gram_index.insert(id, tag.name.clone());
         self.n2gram_index.insert(id, tag.name.clone());
     }
 
     fn remove(&mut self, id: ID, tag: &Tag) {
+        let abv = abbreviate(&tag.name);
+        self.abbreviations.remove(id, &abv);
         self.n1gram_index.remove(id, tag.name.clone());
         self.n2gram_index.remove(id, tag.name.clone());
     }
@@ -219,66 +242,6 @@ impl Index<Tag> for TagDbNameIndex {
         }
         self.remove(id, old);
         self.insert(id, new);
-    }
-}
-
-#[derive(Default)]
-struct TagAbbreviations {
-    items: HashMap<String, Vec<(u32, String)>>,
-}
-
-impl TagAbbreviations {
-    fn abbreviate(text: &str) -> String {
-        text.replace(|c| ['(', ')'].contains(&c), "")
-            .split('_')
-            .filter_map(|w| w.chars().next())
-            .collect()
-    }
-
-    fn get(&self, abbreviation: &str) -> Option<&str> {
-        let items = self.items.get(abbreviation)?;
-        items.first().map(|(_, tag)| tag.as_str())
-    }
-
-    fn insert(&mut self, text: &str) {
-        let a = Self::abbreviate(text);
-        let items = self.items.entry(a).or_default();
-        if let Some(item) = items.iter_mut().find(|(_, t)| t == text) {
-            item.0 += 1;
-        } else {
-            let item = (1, text.to_string());
-            if let Err(index) = items.binary_search_by(|probe| probe.cmp(&item).reverse()) {
-                items.insert(index, item);
-            };
-        }
-    }
-
-    fn insert_item(&mut self, text: &str, count: u32) {
-        let a = Self::abbreviate(text);
-        let items = self.items.entry(a).or_default();
-        let item = (count, text.to_string());
-        let index = items
-            .binary_search_by(|probe| probe.cmp(&item).reverse())
-            .unwrap_or_else(|e| e);
-        items.insert(index, item);
-    }
-
-    fn remove(&mut self, text: &str) {
-        let a = Self::abbreviate(text);
-        let Some(items) = self.items.get_mut(&a) else {
-            return;
-        };
-        if let Some((index, (count, _))) =
-            items.iter_mut().enumerate().find(|(_, (_, t))| t == text)
-        {
-            *count -= 1;
-            if *count == 0 {
-                items.remove(index);
-                if items.is_empty() {
-                    self.items.remove(&a);
-                }
-            }
-        }
     }
 }
 
@@ -301,10 +264,6 @@ impl IndexLoader<BooruPost> for TagIndexLoader {
 
     fn load(self: Box<Self>) -> Box<dyn Index<BooruPost>> {
         let keys_index = self.keys_loader.load();
-        let mut abbreviations = TagAbbreviations::default();
-        for (tag, q) in &keys_index.items {
-            abbreviations.insert_item(tag.as_ref(), q.matched() as u32);
-        }
 
         let tag_db = {
             let tags = keys_index.items.iter().map(|(name, queryable)| Tag {
@@ -318,17 +277,12 @@ impl IndexLoader<BooruPost> for TagIndexLoader {
                 .with_loader("id", TagDbIdIndexLoader::default())
                 .load(tags)
         };
-        let index = TagIndex {
-            abbreviations,
-            keys_index,
-            tag_db,
-        };
+        let index = TagIndex { keys_index, tag_db };
         Box::new(index)
     }
 }
 
 pub struct TagIndex {
-    abbreviations: TagAbbreviations,
     pub keys_index: KeysIndex<Arc<str>>,
     pub tag_db: TagDb,
 }
@@ -398,10 +352,15 @@ impl Index<BooruPost> for TagIndex {
             let item = Item::OrChain(tags);
             return Some(Query::new(item, inverse));
         }
-        let queryable = if let Some(text) = text.strip_prefix('/') {
-            self.abbreviations
-                .get(text)
-                .and_then(|tag| self.keys_index.get(tag))
+        let queryable = if text.starts_with('/') {
+            let query = Query::new(Item::Single(text.to_string()), false);
+            let result = self.tag_db.query(&query).ok()?;
+            let count_index: &TagDbCountIndex = self.tag_db.index().unwrap();
+            let sort = count_index.range_index.ids().iter().copied();
+            let id = *result.get_sorted(sort, 0, 1, true).first()?;
+            let id_index: &TagDbIdIndex = self.tag_db.index().unwrap();
+            let name = id_index.id_to_name.get(&id)?;
+            self.keys_index.get(name)
         } else {
             self.keys_index.get(text)
         }?;
@@ -412,8 +371,6 @@ impl Index<BooruPost> for TagIndex {
     fn insert(&mut self, id: ID, post: &BooruPost) {
         self.keys_index.insert(id, post.tags.iter());
         for tag in &post.tags {
-            self.abbreviations.insert(tag);
-
             let name = tag.clone();
             self.add_tag(name);
         }
@@ -422,8 +379,6 @@ impl Index<BooruPost> for TagIndex {
     fn remove(&mut self, id: ID, post: &BooruPost) {
         self.keys_index.remove(id, post.tags.iter());
         for tag in &post.tags {
-            self.abbreviations.remove(tag);
-
             let name = tag.clone();
             self.remove_tag(name);
         }
@@ -439,14 +394,10 @@ impl Index<BooruPost> for TagIndex {
         let added = new_tags.difference(&old_tags);
         let removed = old_tags.difference(&new_tags);
         for &tag in added {
-            self.abbreviations.insert(tag);
-
             let name = tag.clone();
             self.add_tag(name);
         }
         for &tag in removed {
-            self.abbreviations.remove(tag);
-
             let name = tag.clone();
             self.remove_tag(name);
         }
