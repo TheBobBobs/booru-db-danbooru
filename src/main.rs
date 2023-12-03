@@ -4,17 +4,19 @@ use std::{
     time::Instant,
 };
 
-use axum::{extract::Query as RQuery, routing::get, Extension, Json, Router};
-use booru_db::{db, Query};
+use axum::{routing::get, Router};
+use booru_db::db;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgListener, Executor};
 use tokio::sync::RwLock;
 
 mod index;
 use index::*;
 mod post;
 use post::{BooruPost, RawBooruPost};
+mod routes;
+use routes::{posts::get_posts, tags::get_tags};
+mod sync;
+use sync::{create_listener, handle_listener};
 
 db!(BooruPost);
 
@@ -28,46 +30,11 @@ async fn main() {
         let uri = std::env::args().nth(1).unwrap();
         let pool = sqlx::PgPool::connect(&uri).await.unwrap();
 
-        let mut listener = None;
-        if SYNC {
-            pool.execute(
-            r#"
-            CREATE OR REPLACE FUNCTION posts_notify() RETURNS TRIGGER as $posts_notify$
-            BEGIN
-                CASE TG_OP
-                    WHEN 'UPDATE' THEN
-                        PERFORM pg_notify('public_posts_update', '{"old":' || row_to_json(OLD)::text || ',"new":' || row_to_json(NEW)::text || '}');
-                        RETURN NEW;
-                    WHEN 'INSERT' THEN
-                        PERFORM pg_notify('public_posts_insert', row_to_json(NEW)::text);
-                        RETURN NEW;
-                    WHEN 'DELETE' THEN
-                        PERFORM pg_notify('public_posts_delete', row_to_json(OLD)::text);
-                        RETURN OLD;
-                END CASE;
-            END;
-            $posts_notify$ LANGUAGE plpgsql
-            "#,
-            )
-            .await.unwrap();
-            pool.execute(
-                "CREATE OR REPLACE TRIGGER public_posts_trigger
-                AFTER INSERT OR UPDATE OR DELETE ON public.posts
-                FOR EACH ROW
-                EXECUTE FUNCTION posts_notify()",
-            )
-            .await
-            .unwrap();
-            let mut l = PgListener::connect(&uri).await.unwrap();
-            l.listen_all(vec![
-                "public_posts_insert",
-                "public_posts_update",
-                "public_posts_delete",
-            ])
-            .await
-            .unwrap();
-            listener = Some(l);
-        }
+        let listener = if SYNC {
+            Some(create_listener(&uri, &pool).await)
+        } else {
+            None
+        };
 
         let mut posts = sqlx::query_as::<_, RawBooruPost>("SELECT * FROM posts").fetch(&pool);
         let mut count = 0;
@@ -115,256 +82,19 @@ async fn main() {
     println!("Index: {:.3}s", elapsed as f64 / 1000.0 / 1000.0 / 1000.0);
 
     let db = Arc::new(RwLock::new(db));
-    if SYNC {
-        #[derive(Deserialize)]
-        struct Update {
-            old: RawBooruPost,
-            new: RawBooruPost,
-        }
+    if let Some(pg_listener) = pg_listener.await.unwrap() {
         let db = db.clone();
-        let mut pg_listener = pg_listener.await.unwrap().unwrap();
         tokio::spawn(async move {
-            while let Ok(notif) = pg_listener.recv().await {
-                let channel = notif.channel();
-                let payload = notif.payload();
-                let start_time = Instant::now();
-                match channel {
-                    "public_posts_update" => {
-                        let data: Update = serde_json::from_str(payload).unwrap();
-                        let old: BooruPost = data.old.into();
-                        let new = data.new.into();
-                        let mut db = db.write().await;
-                        let id_index: &IdIndex = db.index().unwrap();
-                        let id = id_index.post_id_to_id(old.id).unwrap();
-                        db.update(id, &old, &new);
-                    }
-                    "public_posts_insert" => {
-                        let raw: RawBooruPost = serde_json::from_str(payload).unwrap();
-                        let post = raw.into();
-                        let mut db = db.write().await;
-                        let id = db.next_id();
-                        db.insert(id, &post);
-                    }
-                    "public_posts_delete" => {
-                        let raw: RawBooruPost = serde_json::from_str(payload).unwrap();
-                        let post: BooruPost = raw.into();
-                        let mut db = db.write().await;
-                        let id_index: &IdIndex = db.index().unwrap();
-                        let id = id_index.post_id_to_id(post.id).unwrap();
-                        db.remove(id, &post);
-                    }
-                    _ => {
-                        unreachable!()
-                    }
-                };
-                let elapsed = start_time.elapsed().as_nanos();
-                println!("{channel}: {:.3}ms", elapsed as f64 / 1000.0 / 1000.0);
-            }
+            handle_listener(db, pg_listener).await;
         });
     }
 
     let app = Router::new()
         .route("/posts", get(get_posts))
         .route("/tags", get(get_tags))
-        .layer(Extension(db.clone()));
+        .with_state(db.clone());
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let _ = axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await;
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Sort {
-    IdAsc,
-    #[default]
-    #[serde(alias = "id")]
-    IdDesc,
-    ScoreAsc,
-    #[serde(alias = "score")]
-    ScoreDesc,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct GetPostsQuery {
-    #[serde(default, alias = "q")]
-    query: String,
-    #[serde(default)]
-    sort: Sort,
-
-    #[serde(default)]
-    page: usize,
-    #[serde(default = "posts_default_limit")]
-    limit: usize,
-}
-
-const fn posts_default_limit() -> usize {
-    20
-}
-
-#[derive(Default, Serialize)]
-struct PostsResponseTimings {
-    query: u64,
-    sort: u64,
-}
-
-#[derive(Serialize)]
-struct PostsResponse {
-    matched: usize,
-    url: String,
-    timings: PostsResponseTimings,
-}
-
-async fn get_posts(
-    Extension(db): Extension<Arc<RwLock<Db>>>,
-    RQuery(GetPostsQuery {
-        query,
-        sort,
-        page,
-        limit,
-    }): RQuery<GetPostsQuery>,
-) -> Json<PostsResponse> {
-    let mut timings = PostsResponseTimings::default();
-
-    let mut query = Query::parse(&query).unwrap(); // TODO
-    query.simplify();
-
-    let db = db.read().await;
-
-    let start_time = Instant::now();
-    let result = db.query(&query).unwrap(); // TODO
-    let elapsed = start_time.elapsed().as_nanos();
-    timings.query = elapsed as u64;
-
-    let index = page * limit;
-    let start_time = Instant::now();
-    let ids = match sort {
-        Sort::IdAsc | Sort::IdDesc => {
-            let reverse = matches!(sort, Sort::IdDesc);
-            let id_index: &IdIndex = db.index().unwrap();
-            let sort = id_index.range_index.ids().iter().copied();
-            result.get_sorted(sort, index, limit, reverse)
-        }
-        Sort::ScoreAsc | Sort::ScoreDesc => {
-            let reverse = matches!(sort, Sort::ScoreDesc);
-            let score_index: &ScoreIndex = db.index().unwrap();
-            let sort = score_index.range_index.ids().iter().copied();
-            result.get_sorted(sort, index, limit, reverse)
-        }
-    };
-    let elapsed = start_time.elapsed().as_nanos();
-    timings.sort = elapsed as u64;
-
-    let id_index: &IdIndex = db.index().unwrap();
-    let post_ids: Vec<_> = ids
-        .into_iter()
-        .map(|id| id_index.id_to_post_id(id).unwrap().to_string())
-        .collect();
-    drop(db);
-
-    let id_search = post_ids.join(",");
-    let url = format!("https://danbooru.donmai.us/posts?tags=id:{id_search}+order:custom");
-
-    let matched = result.matched();
-    let response = PostsResponse {
-        matched,
-        url,
-        timings,
-    };
-    response.into()
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TagsSort {
-    CountAsc,
-    #[default]
-    #[serde(alias = "count")]
-    CountDesc,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct GetTagsQuery {
-    #[serde(default, alias = "q")]
-    query: String,
-    #[serde(default)]
-    sort: TagsSort,
-
-    #[serde(default)]
-    page: usize,
-    #[serde(default = "tags_default_limit")]
-    limit: usize,
-}
-
-const fn tags_default_limit() -> usize {
-    20
-}
-
-#[derive(Default, Serialize)]
-struct TagsResponseTimings {
-    query: u64,
-    sort: u64,
-}
-
-#[derive(Serialize)]
-struct TagsResponse {
-    tags: Vec<(Arc<str>, u32)>,
-    matched: usize,
-    timings: TagsResponseTimings,
-}
-
-async fn get_tags(
-    Extension(db): Extension<Arc<RwLock<Db>>>,
-    RQuery(GetTagsQuery {
-        query,
-        sort,
-        page,
-        limit,
-    }): RQuery<GetTagsQuery>,
-) -> Json<TagsResponse> {
-    let mut timings = TagsResponseTimings::default();
-
-    let mut query = Query::parse(&query).unwrap(); // TODO
-    query.simplify();
-
-    let db = db.read().await;
-    let tag_index: &TagIndex = db.index().unwrap();
-    let tag_db = &tag_index.tag_db;
-
-    let start_time = Instant::now();
-    let result = tag_db.query(&query).unwrap(); // TODO
-    let elapsed = start_time.elapsed().as_nanos();
-    timings.query = elapsed as u64;
-
-    let index = page * limit;
-    let start_time = Instant::now();
-    let ids = match sort {
-        TagsSort::CountAsc | TagsSort::CountDesc => {
-            let reverse = matches!(sort, TagsSort::CountDesc);
-            let count_index: &TagDbCountIndex = tag_db.index().unwrap();
-            let sort = count_index.range_index.ids().iter().copied();
-            result.get_sorted(sort, index, limit, reverse)
-        }
-    };
-    let elapsed = start_time.elapsed().as_nanos();
-    timings.sort = elapsed as u64;
-
-    let id_index: &TagDbIdIndex = tag_db.index().unwrap();
-    let tags: Vec<_> = ids
-        .into_iter()
-        .map(|id| {
-            let name = id_index.id_to_name.get(&id).unwrap();
-            let count = tag_index.keys_index.items.get(name).unwrap().matched() as u32;
-            (name.clone(), count)
-        })
-        .collect();
-    drop(db);
-
-    let matched = result.matched();
-    let response = TagsResponse {
-        tags,
-        matched,
-        timings,
-    };
-    response.into()
 }
