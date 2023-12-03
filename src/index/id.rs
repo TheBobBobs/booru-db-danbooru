@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use booru_db::{
     index::{Index, IndexLoader, RangeIndex, RangeIndexLoader},
     query::Item,
@@ -10,7 +8,7 @@ use crate::BooruPost;
 
 #[derive(Default)]
 pub struct IdIndexLoader {
-    post_id_to_id: HashMap<u32, ID>,
+    post_id_to_id: fxhash::FxHashMap<u32, ID>,
     range_index_loader: RangeIndexLoader<u32>,
 }
 
@@ -30,7 +28,7 @@ impl IndexLoader<BooruPost> for IdIndexLoader {
 }
 
 pub struct IdIndex {
-    post_id_to_id: HashMap<u32, ID>,
+    post_id_to_id: fxhash::FxHashMap<u32, ID>,
     pub range_index: RangeIndex<u32>,
 }
 

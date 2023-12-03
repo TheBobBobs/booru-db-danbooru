@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use booru_db::{
     index::{
@@ -27,8 +24,8 @@ use database::{Db as TagDb, DbLoader as TagDbLoader};
 
 #[derive(Default)]
 struct TagDbIdIndexLoader {
-    name_to_id: HashMap<Arc<str>, ID>,
-    id_to_name: HashMap<ID, Arc<str>>,
+    name_to_id: fxhash::FxHashMap<Arc<str>, ID>,
+    id_to_name: fxhash::FxHashMap<ID, Arc<str>>,
 }
 
 impl IndexLoader<Tag> for TagDbIdIndexLoader {
@@ -46,8 +43,8 @@ impl IndexLoader<Tag> for TagDbIdIndexLoader {
 }
 
 pub struct TagDbIdIndex {
-    pub name_to_id: HashMap<Arc<str>, ID>,
-    pub id_to_name: HashMap<ID, Arc<str>>,
+    pub name_to_id: fxhash::FxHashMap<Arc<str>, ID>,
+    pub id_to_name: fxhash::FxHashMap<ID, Arc<str>>,
 }
 
 impl Index<Tag> for TagDbIdIndex {
@@ -203,9 +200,16 @@ impl Index<Tag> for TagDbNameIndex {
                 }
             }
             TextQuery::Contains(text) => {
-                for (t, id) in smallest {
-                    if t.contains(&text) {
+                if text.len() <= 2 {
+                    ids.reserve(smallest.len());
+                    for (_, id) in smallest {
                         ids.push(*id);
+                    }
+                } else {
+                    for (t, id) in smallest {
+                        if t.contains(&text) {
+                            ids.push(*id);
+                        }
                     }
                 }
             }

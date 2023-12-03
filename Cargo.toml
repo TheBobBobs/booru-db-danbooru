@@ -11,6 +11,7 @@ axum = "0.6.20"
 booru-db = { git = "https://github.com/TheBobBobs/booru-db.git" }
 chrono = { version = "0.4.31", features = ["serde"] }
 futures = "0.3.29"
+fxhash = "0.2.1"
 serde = "1.0"
 serde_json = "1.0.108"
 sqlx = { version = "0.7.2", features = [ "chrono", "postgres", "runtime-tokio" ] }
